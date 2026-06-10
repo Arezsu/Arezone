@@ -1,0 +1,10 @@
+{
+  "app_name": "AREZONE",
+  "business_name": "PANADERIA TRIGO Y SABOR",
+  "version": "2.0 - Edicion Senior",
+  "slogan": "Facil, grande y simple para todos",
+  "default_seller": "GLORIA",
+  "currency": "COP",
+  "invoice_prefix": "POS-",
+  "source_excel": "RPTARJETA_TO_XLS.xlsx"
+}

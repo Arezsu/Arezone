@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+data/*.db
+data/*.db-*
+data/tickets/
+build/
+build_output/
+dist/
+*.spec
+installer/output/
+.venv/
+venv/
