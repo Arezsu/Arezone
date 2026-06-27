@@ -421,6 +421,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             self.cart_tree.heading(col, text=title)
             self.cart_tree.column(col, width=width, anchor="e" if col in {"qty", "price", "total"} else "w")
         set_tree_theme(self.cart_tree, self.theme_name)
+        self.cart_tree.config(selectmode="extended")
         self.cart_tree.bind("<Delete>", lambda _event: self.remove_selected_cart_item())
         self.cart_tree.bind("<KeyPress-x>", lambda _event: self.remove_selected_cart_item())
 
@@ -474,7 +475,14 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             ("SALIR", self.show_home_screen),
         ]
         for index, (text, command) in enumerate(actions, start=4):
-            big_button(right, text, command, self.theme_name, bg=c["primary"] if text == "PAGAR" else None, fg=c["primary_text"] if text == "PAGAR" else None).grid(
+            big_button(
+                right,
+                text,
+                lambda cmd=command: self.after(100, cmd),
+                self.theme_name,
+                bg=c["primary"] if text == "PAGAR" else None,
+                fg=c["primary_text"] if text == "PAGAR" else None,
+            ).grid(
                 row=index,
                 column=0,
                 columnspan=3,
@@ -552,7 +560,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             ("AYER", lambda: self.set_report_range("yesterday")),
             ("SEMANA", lambda: self.set_report_range("week")),
             ("MES", lambda: self.set_report_range("month")),
-            ("ANO", lambda: self.set_report_range("year")),
+            ("AÑO", lambda: self.set_report_range("year")),
             ("ELEGIR", self.custom_report_range),
         ]):
             big_button(ranges, text, command, self.theme_name, height=1).grid(row=0, column=col, sticky="ew", padx=4)
@@ -1881,19 +1889,20 @@ class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
             self.tree.heading(col, text=text)
             self.tree.column(col, width=width, anchor="e" if col == "total" else "w")
         set_tree_theme(self.tree, self.theme_name)
-        self.tree.bind("<Double-1>", lambda _event: self.annul_selected())
+        self.tree.bind("<Double-1>", lambda _event: self.show_selected_sale_detail())
 
         actions = themed_frame(self, self.theme_name, panel=True)
         actions.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 18))
-        actions.columnconfigure((0, 1, 2), weight=1)
-        big_button(actions, "ANULAR SELECCION", self.annul_selected, self.theme_name, height=1, bg=c["danger"], fg="#ffffff").grid(
+        actions.columnconfigure((0, 1, 2, 3), weight=1)
+        big_button(actions, "ANULAR FACTURA", self.annul_selected, self.theme_name, height=1, bg=c["danger"], fg="#ffffff").grid(
             row=0,
             column=0,
             sticky="ew",
             padx=5,
         )
-        big_button(actions, "RECARGAR", self.refresh, self.theme_name, height=1).grid(row=0, column=1, sticky="ew", padx=5)
-        big_button(actions, "CERRAR", self.destroy, self.theme_name, height=1).grid(row=0, column=2, sticky="ew", padx=5)
+        big_button(actions, "VER DETALLE", self.show_selected_sale_detail, self.theme_name, height=1).grid(row=0, column=1, sticky="ew", padx=5)
+        big_button(actions, "RECARGAR", self.refresh, self.theme_name, height=1).grid(row=0, column=2, sticky="ew", padx=5)
+        big_button(actions, "CERRAR", self.destroy, self.theme_name, height=1).grid(row=0, column=3, sticky="ew", padx=5)
 
     def refresh(self) -> None:
         for item in self.tree.get_children():
@@ -1985,6 +1994,90 @@ class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
         self.refresh()
         if self.on_annulled:
             self.on_annulled()
+
+    def show_selected_sale_detail(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            play_sound(self.conn, "warn")
+            return
+        sale_id = int(selected[0])
+        sale = self.conn.execute(
+            """
+            SELECT invoice_no, created_at, seller, customer, subtotal, tax_total, total, status, COALESCE(voided_reason, '') AS voided_reason
+            FROM sales
+            WHERE id = ?
+            """,
+            (sale_id,),
+        ).fetchone()
+        if sale is None:
+            return
+
+        items = self.conn.execute(
+            """
+            SELECT code, name, quantity, unit_price, line_total
+            FROM sale_items
+            WHERE sale_id = ?
+            """,
+            (sale_id,),
+        ).fetchall()
+
+        c = self.colors
+        detail = tk.Toplevel(self)
+        detail.title(f"Detalle factura {sale['invoice_no']}")
+        fit_window(detail, 1000, 640, min_width=900, min_height=520)
+        detail.transient(self)
+        detail.grab_set()
+        detail.configure(bg=c['bg'])
+        detail.columnconfigure(0, weight=1)
+        detail.rowconfigure(1, weight=1)
+
+        header = themed_frame(detail, self.theme_name, panel=True, border=True)
+        header.grid(row=0, column=0, sticky='ew', padx=18, pady=(18, 8))
+        header.columnconfigure((0, 1, 2), weight=1)
+        tk.Label(header, text=f"FACTURA: {sale['invoice_no']}", bg=c['panel'], fg=c['text'], font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky='w', padx=12, pady=10)
+        tk.Label(header, text=f"FECHA: {sale['created_at']}", bg=c['panel'], fg=c['muted'], font=("Segoe UI", 14, "bold")).grid(row=1, column=0, sticky='w', padx=12, pady=(0, 8))
+        tk.Label(header, text=f"VENDEDOR: {sale['seller'] or ''}", bg=c['panel'], fg=c['muted'], font=("Segoe UI", 14, "bold")).grid(row=0, column=1, sticky='w', padx=12, pady=10)
+        tk.Label(header, text=f"CLIENTE: {sale['customer'] or 'PARTICULAR'}", bg=c['panel'], fg=c['muted'], font=("Segoe UI", 14, "bold")).grid(row=1, column=1, sticky='w', padx=12, pady=(0, 8))
+        tk.Label(header, text=f"ESTADO: {sale['status'] or 'COMPLETADA'}", bg=c['panel'], fg=c['muted'], font=("Segoe UI", 14, "bold")).grid(row=0, column=2, sticky='w', padx=12, pady=10)
+        tk.Label(header, text=f"TOTAL: {money(sale['total'])}", bg=c['panel'], fg=c['text'], font=("Segoe UI", 18, "bold")).grid(row=1, column=2, sticky='w', padx=12, pady=(0, 8))
+
+        body = themed_frame(detail, self.theme_name, panel=True, border=True)
+        body.grid(row=1, column=0, sticky='nsew', padx=18, pady=8)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        columns = ("code", "name", "quantity", "unit_price", "line_total")
+        tree = ttk.Treeview(body, columns=columns, show='headings', selectmode='browse')
+        tree.grid(row=0, column=0, sticky='nsew', padx=14, pady=14)
+        for col, text, width in [
+            ("code", "CODIGO", 140),
+            ("name", "PRODUCTO", 360),
+            ("quantity", "CANT.", 90),
+            ("unit_price", "PRECIO", 130),
+            ("line_total", "TOTAL", 130),
+        ]:
+            tree.heading(col, text=text)
+            tree.column(col, width=width, anchor='e' if col in {"quantity", "unit_price", "line_total"} else 'w')
+        set_tree_theme(tree, self.theme_name)
+
+        for item in items:
+            tree.insert(
+                '',
+                'end',
+                values=(
+                    item['code'],
+                    item['name'],
+                    number(item['quantity']),
+                    money(item['unit_price']),
+                    money(item['line_total']),
+                ),
+            )
+
+        footer = themed_frame(detail, self.theme_name, panel=True, border=True)
+        footer.grid(row=2, column=0, sticky='ew', padx=18, pady=(0, 18))
+        footer.columnconfigure(0, weight=1)
+        big_button(footer, 'CERRAR', detail.destroy, self.theme_name, height=1).grid(row=0, column=0, sticky='ew', padx=18, pady=12)
+        pop_in_window(detail)
 
 
 def configure_autostart(enabled: bool) -> None:
