@@ -30,7 +30,8 @@ class SettingsWindow(tk.Toplevel):
         self.expense_amount_var = tk.StringVar()
 
         self.title("Ajustes AREZONE")
-        self.geometry("980x720")
+        fit_window(self, 980, 720, min_width=900, min_height=680)
+        self.resizable(True, True)
         self.transient(master)
         self.grab_set()
         self.columnconfigure(0, weight=1)

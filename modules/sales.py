@@ -1,10 +1,13 @@
 ﻿from __future__ import annotations
 
 import csv
+import importlib
 import json
 import os
+import re
 import sqlite3
 import sys
+import threading
 import tkinter as tk
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -20,10 +23,24 @@ from modules.formatters import money, number, parse_amount
 from modules.payment import PaymentWindow
 from modules.ticket_print import build_sample_ticket, save_ticket, try_open_drawer, try_print_ticket
 from modules.product_codes import split_primary_and_alternates
+from modules.product_search import search_products
 from modules.security import get_setting, hash_secret, set_setting, verify_secret
 from modules.ps5_ui import PS5_BG, PS5_HINT, PS5_MUTED, PS5_PANEL, PS5_TEXT, ps5_button
 from modules.theme import FONT_BIG, FONT_TITLE, THEME_CHOICES, THEMES, ThemeMixin, app_logo_label, big_button, fit_window, set_tree_theme, themed_frame
 from modules.ui_fx import ask_secret, fade_in_window, play_sound, pop_in_window
+
+
+DEFAULT_SHORTCUTS = {
+    "pay": "F1",
+    "remove_item": "Delete",
+    "hold_sale": "F6",
+}
+
+SHORTCUT_LABELS = {
+    "pay": "PAGAR",
+    "remove_item": "ELIMINAR ITEM",
+    "hold_sale": "PONER EN ESPERA",
+}
 
 
 class SalesFrame(ttk.Frame, ThemeMixin):
@@ -52,17 +69,21 @@ class SalesFrame(ttk.Frame, ThemeMixin):
         self._payment_window: PaymentWindow | None = None
         self.active_screen = "home"
         self.report_range = self._range_today()
+        self._shortcut_settings = self._load_shortcut_settings()
         self.current_report_rows: list[tuple[str, str]] = []
         self.nav_buttons: list[tk.Button] = []
         self.nav_focus_index = 0
         self.home_buttons: list[tk.Button] = []
         self.home_focus_index = 0
+        self._voice_stop = threading.Event()
+        self._voice_thread: threading.Thread | None = None
 
         self.apply_common_styles()
         self._build_shell()
         self.show_home_screen()
         self._bind_shortcuts()
         self.update_clock()
+        self._start_voice_commands_if_enabled()
         self.after(700, self.maybe_auto_import)
 
     def _build_shell(self) -> None:
@@ -168,20 +189,14 @@ class SalesFrame(ttk.Frame, ThemeMixin):
 
     def _bind_shortcuts(self) -> None:
         root = self.winfo_toplevel()
-        root.bind("<F1>", self._on_f1_key)
         root.bind("<F2>", lambda _event: self.show_products_screen())
         root.bind("<F3>", lambda _event: self.show_reports_screen())
         root.bind("<F4>", lambda _event: self.show_settings_screen())
         root.bind("<F5>", lambda _event: self.context_refresh())
-        root.bind("<F6>", lambda _event: self.hold_sale())
         root.bind("<F7>", lambda _event: self.show_home_screen())
         root.bind("<F8>", lambda _event: self.show_about())
         root.bind("<F9>", lambda _event: self.cycle_theme())
         root.bind("<F10>", lambda _event: self.exit_module())
-        root.bind("<Delete>", lambda _event: self.remove_selected_cart_item())
-        root.bind("<BackSpace>", lambda _event: self.remove_selected_cart_item())
-        root.bind("<KeyPress-x>", lambda _event: self.remove_selected_cart_item())
-        root.bind("<KeyPress-X>", lambda _event: self.remove_selected_cart_item())
         root.bind("<Escape>", lambda _event: self.show_home_screen())
         root.bind("<Left>", lambda event: self._handle_nav_arrow(event, -1), add="+")
         root.bind("<Up>", lambda event: self._handle_nav_arrow(event, -1), add="+")
@@ -189,15 +204,127 @@ class SalesFrame(ttk.Frame, ThemeMixin):
         root.bind("<Down>", lambda event: self._handle_nav_arrow(event, 1), add="+")
         root.bind("<Return>", self._handle_nav_enter, add="+")
         root.bind("<KP_Enter>", self._handle_nav_enter, add="+")
+        self._bind_configured_shortcuts(root)
+
+    def _bind_configured_shortcuts(self, root) -> None:
+        self._shortcut_settings = self._load_shortcut_settings()
+        for action in ("pay", "remove_item", "hold_sale"):
+            seq = self._shortcut_event_name(action)
+            try:
+                root.unbind(seq)
+            except tk.TclError:
+                pass
+            if action == "pay":
+                root.bind(seq, self._on_f1_key)
+            elif action == "remove_item":
+                root.bind(seq, self._on_remove_item_shortcut)
+            else:
+                root.bind(seq, self._on_hold_sale_shortcut)
+
+    def _load_shortcut_settings(self) -> dict[str, str]:
+        return {
+            action: (get_setting(self.conn, f"shortcut_{action}", DEFAULT_SHORTCUTS[action]) or DEFAULT_SHORTCUTS[action]).strip()
+            for action in DEFAULT_SHORTCUTS
+        }
+
+    def _shortcut_event_name(self, action: str) -> str:
+        value = self._shortcut_settings.get(action, DEFAULT_SHORTCUTS[action])
+        normalized = self._normalize_shortcut_key(value)
+        return f"<KeyPress-{normalized}>"
+
+    def _normalize_shortcut_key(self, value: str) -> str:
+        if not value:
+            return ""
+        key = str(value).strip()
+        if not key:
+            return ""
+        if key.startswith("<") and key.endswith(">"):
+            return key[1:-1]
+        return key
 
     def _on_f1_key(self, _event=None):
         if self._payment_window is not None and self._payment_window.winfo_exists():
-            return None
+            self._payment_window.finish()
+            return "break"
         if self.active_screen == "sales":
             self.open_payment()
         else:
             self.show_sales_screen()
         return "break"
+
+    def _on_remove_item_shortcut(self, _event=None):
+        self.remove_selected_cart_item()
+        return "break"
+
+    def _on_hold_sale_shortcut(self, _event=None):
+        self.hold_sale()
+        return "break"
+
+    def refresh_shortcuts(self) -> None:
+        self._shortcut_settings = self._load_shortcut_settings()
+        if hasattr(self, "winfo_toplevel"):
+            try:
+                self._bind_configured_shortcuts(self.winfo_toplevel())
+            except Exception:
+                pass
+
+    def _start_voice_commands_if_enabled(self) -> None:
+        """Activa escucha opcional sin impedir que el POS funcione sin micrófono."""
+        if get_setting(self.conn, "voice_commands_enabled", "0") != "1" or self._voice_thread is not None:
+            return
+        try:
+            sr = importlib.import_module("speech_recognition")
+            recognizer = sr.Recognizer()
+            microphone = sr.Microphone()
+        except Exception:
+            return
+
+        def listen() -> None:
+            try:
+                with microphone as source:
+                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
+            except Exception:
+                return
+
+            while not self._voice_stop.is_set():
+                try:
+                    with microphone as source:
+                        audio = recognizer.listen(source, timeout=1, phrase_time_limit=3)
+                    command = recognizer.recognize_google(audio, language="es-CO").strip().lower()
+                    self.after(0, lambda text=command: self._run_voice_command(text))
+                except sr.WaitTimeoutError:
+                    continue
+                except Exception:
+                    continue
+
+        self._voice_thread = threading.Thread(target=listen, name="arezone-voice", daemon=True)
+        self._voice_thread.start()
+
+    def _run_voice_command(self, text: str) -> None:
+        commands = {
+            "pay": get_setting(self.conn, "voice_pay_command", "pagar").lower(),
+            "remove_item": get_setting(self.conn, "voice_remove_command", "eliminar producto").lower(),
+            "hold_sale": get_setting(self.conn, "voice_hold_command", "poner en espera").lower(),
+        }
+        if self._voice_text_matches(text, commands["pay"]):
+            self._on_f1_key()
+        elif self._voice_text_matches(text, commands["remove_item"]):
+            self._on_remove_item_shortcut()
+        elif self._voice_text_matches(text, commands["hold_sale"]):
+            self._on_hold_sale_shortcut()
+
+    def _voice_text_matches(self, text: str, phrase: str) -> bool:
+        if not text or not phrase:
+            return False
+        normalized_phrase = re.sub(r"[^\w\s]", "", phrase.lower()).strip()
+        normalized_text = re.sub(r"[^\w\s]", "", text.lower()).strip()
+        if not normalized_phrase or not normalized_text:
+            return False
+        if normalized_phrase == normalized_text:
+            return True
+        if f" {normalized_phrase} " in f" {normalized_text} ":
+            return True
+        return normalized_phrase in normalized_text
 
     def _handle_nav_arrow(self, event: tk.Event, delta: int):
         if self.active_screen == "home" and self.home_buttons and self._can_use_nav_keys(event):
@@ -371,7 +498,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
         root.columnconfigure(1, weight=2)
         root.rowconfigure(0, weight=1)
 
-        left = themed_frame(root, self.theme_name, panel=True, border=True)
+        left = themed_frame(root, self.theme_name, panel=True, border=False)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
         left.columnconfigure(0, weight=1)
         left.rowconfigure(2, weight=1)
@@ -386,7 +513,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
         self.search_entry = tk.Entry(search, textvariable=self.search_var, font=("Segoe UI", 22, "bold"), bg=c["input_bg"], fg=c["input_text"], insertbackground=c["input_text"])
         self.search_entry.grid(row=0, column=0, sticky="ew", ipady=14, padx=(0, 8))
         self.search_entry.bind("<Return>", lambda _event: self.add_from_input())
-        self.search_entry.focus_set()
+        self.after_idle(self._focus_search_entry)
         big_button(search, "BUSCAR", self.find_product_for_sale, self.theme_name, height=1).grid(row=0, column=1, sticky="ew")
         unit_box = tk.Frame(search, bg=c["panel"], highlightthickness=1, highlightbackground=c["primary"])
         unit_box.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -421,7 +548,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             self.cart_tree.heading(col, text=title)
             self.cart_tree.column(col, width=width, anchor="e" if col in {"qty", "price", "total"} else "w")
         set_tree_theme(self.cart_tree, self.theme_name)
-        self.cart_tree.config(selectmode="extended")
+        self.cart_tree.config(selectmode="browse")
         self.cart_tree.bind("<Delete>", lambda _event: self.remove_selected_cart_item())
         self.cart_tree.bind("<KeyPress-x>", lambda _event: self.remove_selected_cart_item())
 
@@ -452,7 +579,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             insertbackground=c["input_text"],
         ).grid(row=2, column=1, sticky="ew", pady=(8, 0), ipady=5)
 
-        right = themed_frame(root, self.theme_name, panel=True, border=True)
+        right = themed_frame(root, self.theme_name, panel=True, border=False)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure((0, 1, 2), weight=1)
         for row in range(10):
@@ -478,7 +605,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             big_button(
                 right,
                 text,
-                lambda cmd=command: self.after(100, cmd),
+                lambda cmd=command: self.after(500, cmd),
                 self.theme_name,
                 bg=c["primary"] if text == "PAGAR" else None,
                 fg=c["primary_text"] if text == "PAGAR" else None,
@@ -599,6 +726,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             ("HORARIO NOCHE", self.show_night_settings),
             ("DATOS DE TIENDA", self.open_store_creator),
             ("PAGOS A PROVEEDORES", self.show_brand_payments_window),
+            ("COMANDOS RAPIDOS", self.open_quick_shortcuts_window),
             ("CAMBIAR CLAVE", self.open_super_admin),
         ]
         cards.append(("INFO DEL SISTEMA", self.show_about))
@@ -607,6 +735,9 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             col = index % 2
             big_button(root, text, command, self.theme_name).grid(row=row, column=col, sticky="nsew", padx=18, pady=18)
         self._fade_shell()
+
+    def open_quick_shortcuts_window(self) -> None:
+        QuickShortcutSettingsWindow(self, self.conn, self.theme_name)
 
     def show_printer_settings(self) -> None:
         PrinterSettingsWindow(self, self.conn, self.theme_name)
@@ -808,6 +939,38 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             )
         self.total_var.set(money(sum(item["line_total"] for item in self.cart)))
 
+    def _focus_search_entry(self) -> None:
+        if not hasattr(self, "search_entry"):
+            return
+        entry = getattr(self, "search_entry", None)
+        if entry is None or not entry.winfo_exists():
+            return
+        if self.active_screen != "sales":
+            return
+        try:
+            entry.focus_force()
+            entry.icursor("end")
+            entry.selection_range(0, tk.END)
+        except tk.TclError:
+            pass
+
+    def _toggle_cart_selection(self, event: tk.Event | None = None) -> None:
+        if not hasattr(self, "cart_tree"):
+            return
+        tree = self.cart_tree
+        if event is None:
+            return
+        item = tree.identify_row(event.y)
+        if not item:
+            tree.selection_set()
+            return
+        if item in tree.selection():
+            tree.selection_remove(item)
+        else:
+            tree.selection_add(item)
+        tree.focus(item)
+        tree.see(item)
+
     def open_payment(self) -> None:
         if not self.cart:
             play_sound(self.conn, "warn")
@@ -825,6 +988,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             self.customer_var.get(),
             self.theme_name,
             on_complete=self.complete_sale,
+            confirm_shortcut=self._shortcut_settings.get("pay", DEFAULT_SHORTCUTS["pay"]),
         )
         self._payment_window.bind("<Destroy>", self._clear_payment_window, add="+")
 
@@ -834,36 +998,43 @@ class SalesFrame(ttk.Frame, ThemeMixin):
         self.refresh_cart()
         self._payment_window = None
 
-        # Restaurar el foco al campo de búsqueda después de que PaymentWindow y messagebox se cierren
         if hasattr(self, 'search_entry'):
-            self.after(500, lambda: self.search_entry.focus_force())
+            self.after(500, self._focus_search_entry)
+            self.after(700, self._focus_search_entry)
         
     def _clear_payment_window(self, _event=None) -> None:
         self._payment_window = None
 
     def hold_sale(self) -> None:
         if not self.cart:
-            row = self.conn.execute("SELECT id, payload FROM held_sales ORDER BY id DESC LIMIT 1").fetchone()
-            if not row:
-                messagebox.showinfo("Espera", "No hay venta en espera.")
-                return
-            payload = json.loads(row["payload"])
-            self.cart = payload.get("items", [])
-            self.conn.execute("DELETE FROM held_sales WHERE id = ?", (row["id"],))
-            self.conn.commit()
-            self.refresh_cart()
-            messagebox.showinfo("Espera", "Venta recuperada.")
+            HeldSalesWindow(self, self.conn, self.theme_name, self.resume_held_sale)
             return
         if not messagebox.askyesno("Guardar venta", "Guardar esta venta en espera?"):
             return
+        name = simpledialog.askstring("Venta en espera", "Nombre para identificar esta venta:", initialvalue="VENTA EN ESPERA", parent=self)
+        if name is None:
+            return
+        name = name.strip().upper() or "VENTA EN ESPERA"
         self.conn.execute(
-            "INSERT INTO held_sales(created_at, payload) VALUES(?, ?)",
-            (now_text(), json.dumps({"items": self.cart}, ensure_ascii=False)),
+            "INSERT INTO held_sales(created_at, name, payload) VALUES(?, ?, ?)",
+            (now_text(), name, json.dumps({"items": self.cart}, ensure_ascii=False)),
         )
         self.conn.commit()
         self.cart.clear()
         self.refresh_cart()
-        messagebox.showinfo("Espera", "Venta guardada.")
+        messagebox.showinfo("Espera", f"Venta guardada como: {name}.")
+
+    def resume_held_sale(self, held_sale_id: int) -> None:
+        row = self.conn.execute("SELECT id, name, payload FROM held_sales WHERE id = ?", (held_sale_id,)).fetchone()
+        if row is None:
+            messagebox.showwarning("Espera", "La venta seleccionada ya no existe.")
+            return
+        payload = json.loads(row["payload"])
+        self.cart = payload.get("items", [])
+        self.conn.execute("DELETE FROM held_sales WHERE id = ?", (row["id"],))
+        self.conn.commit()
+        self.refresh_cart()
+        messagebox.showinfo("Espera", f"Venta recuperada: {row['name']}.")
 
     def clear_sale(self) -> None:
         if self.cart and messagebox.askyesno("Borrar", "Esta seguro de borrar la venta?"):
@@ -877,18 +1048,16 @@ class SalesFrame(ttk.Frame, ThemeMixin):
         if not selected:
             play_sound(self.conn, "warn")
             return
-        indexes = sorted({int(item) for item in selected if str(item).isdigit()}, reverse=True)
-        names = [self.cart[index]["name"] for index in indexes if 0 <= index < len(self.cart)]
-        if not names:
+        item_id = selected[0]
+        if not str(item_id).isdigit():
             return
-        preview = "\n".join(f"- {name}" for name in names[:6])
-        if len(names) > 6:
-            preview += f"\n- ... y {len(names) - 6} mas"
-        if not messagebox.askyesno("Eliminar", f"Quitar los productos seleccionados de la venta?\n\n{preview}"):
+        index = int(item_id)
+        if not 0 <= index < len(self.cart):
             return
-        for index in indexes:
-            if 0 <= index < len(self.cart):
-                self.cart.pop(index)
+        item_name = self.cart[index]["name"]
+        if not messagebox.askyesno("Eliminar", f"Quitar este producto de la venta?\n\n- {item_name}"):
+            return
+        self.cart.pop(index)
         self.refresh_cart()
         play_sound(self.conn, "ok")
 
@@ -900,17 +1069,17 @@ class SalesFrame(ttk.Frame, ThemeMixin):
             return
         for row in self.products_tree.get_children():
             self.products_tree.delete(row)
-        query = f"%{self.product_search_var.get().strip()}%"
-        rows = self.conn.execute(
-            """
-            SELECT code, name, price_public, stock, alt_codes
-            FROM products
-            WHERE code LIKE ? OR name LIKE ? OR brand LIKE ? OR category LIKE ? OR COALESCE(alt_codes, '') LIKE ?
-            ORDER BY name
-            LIMIT 500
-            """,
-            (query, query, query, query, query),
-        ).fetchall()
+        rows = search_products(self.conn, self.product_search_var.get(), limit=500)
+        rows = [
+            {
+                "code": row["code"],
+                "name": row["name"],
+                "price_public": row["price_public"],
+                "stock": row["stock"],
+                "alt_codes": row["alt_codes"],
+            }
+            for row in rows
+        ]
         for index, row in enumerate(rows):
             self.products_tree.insert(
                 "",
@@ -998,7 +1167,8 @@ class SalesFrame(ttk.Frame, ThemeMixin):
         row = self.conn.execute(
             """
             SELECT COUNT(*) AS count, COALESCE(SUM(total), 0) AS total, COALESCE(AVG(total), 0) AS average,
-                   COALESCE(SUM(cash), 0) AS cash, COALESCE(SUM(nequi), 0) AS nequi,
+                   COALESCE(SUM(MAX(MIN(COALESCE(cash, 0), total), 0)), 0) AS cash,
+                   COALESCE(SUM(MAX(MIN(COALESCE(nequi, 0), MAX(total - MAX(COALESCE(cash, 0), 0), 0)), 0)), 0) AS nequi,
                    COALESCE(SUM(pse), 0) AS pse, COALESCE(SUM(card), 0) AS card
             FROM sales
             WHERE created_at BETWEEN ? AND ? AND status = 'COMPLETED'
@@ -1118,7 +1288,8 @@ class SalesFrame(ttk.Frame, ThemeMixin):
         start, end = self.report_range
         row = self.conn.execute(
             """
-            SELECT COALESCE(SUM(cash), 0) AS cash, COALESCE(SUM(nequi), 0) AS nequi
+            SELECT COALESCE(SUM(MAX(MIN(COALESCE(cash, 0), total), 0)), 0) AS cash,
+                   COALESCE(SUM(MAX(MIN(COALESCE(nequi, 0), MAX(total - MAX(COALESCE(cash, 0), 0), 0)), 0)), 0) AS nequi
             FROM sales
             WHERE created_at BETWEEN ? AND ? AND status = 'COMPLETED'
             """,
@@ -1147,6 +1318,7 @@ class SalesFrame(ttk.Frame, ThemeMixin):
 
     def exit_module(self) -> None:
         if messagebox.askyesno("Salir", "Esta seguro de salir?"):
+            self._voice_stop.set()
             self.on_logout()
 
 
@@ -1416,16 +1588,7 @@ class ProductPickerDialog(tk.Toplevel, ThemeMixin):
     def search(self) -> None:
         for row in self.tree.get_children():
             self.tree.delete(row)
-        query = f"%{self.query_var.get().strip()}%"
-        rows = self.conn.execute(
-            """
-            SELECT * FROM products
-            WHERE code LIKE ? OR name LIKE ? OR brand LIKE ? OR category LIKE ? OR COALESCE(alt_codes, '') LIKE ?
-            ORDER BY name
-            LIMIT 100
-            """,
-            (query, query, query, query, query),
-        ).fetchall()
+        rows = search_products(self.conn, self.query_var.get(), limit=100)
         for index, row in enumerate(rows):
             self.tree.insert("", "end", iid=row["code"], tags=("even" if index % 2 == 0 else "odd",), values=(row["code"], row["name"], money(row["price_public"])))
 
@@ -1824,6 +1987,237 @@ class BrandPaymentsWindow(tk.Toplevel, ThemeMixin):
         self.total_label.config(text=f"Total pagos a proveedores registrados: {money(total)}")
 
 
+class HeldSalesWindow(tk.Toplevel, ThemeMixin):
+    def __init__(self, master, conn: sqlite3.Connection, theme_name: str, on_resume: Callable[[int], None]) -> None:
+        self.theme_name = theme_name
+        super().__init__(master)
+        self.conn = conn
+        self.on_resume = on_resume
+        self.query_var = tk.StringVar()
+        self.title("Ventas en espera")
+        fit_window(self, 900, 600, min_width=760, min_height=500)
+        self.transient(master)
+        self.apply_common_styles()
+        self._build()
+        self.refresh()
+        pop_in_window(self)
+
+    def _build(self) -> None:
+        c = self.colors
+        self.configure(bg=c["bg"])
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+        tk.Label(self, text="RECUPERAR VENTA EN ESPERA", bg=c["bg"], fg=c["text"], font=FONT_TITLE).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 10))
+        top = themed_frame(self, self.theme_name, panel=True)
+        top.grid(row=1, column=0, sticky="ew", padx=18, pady=8)
+        top.columnconfigure(0, weight=1)
+        entry = tk.Entry(top, textvariable=self.query_var, font=("Segoe UI", 16, "bold"), bg=c["input_bg"], fg=c["input_text"], insertbackground=c["input_text"])
+        entry.grid(row=0, column=0, sticky="ew", padx=(12, 8), pady=10, ipady=6)
+        entry.bind("<Return>", lambda _event: self.refresh())
+        big_button(top, "BUSCAR", self.refresh, self.theme_name, height=1).grid(row=0, column=1, padx=(0, 12), pady=10)
+        self.tree = ttk.Treeview(self, columns=("name", "date", "items", "total"), show="headings", selectmode="browse")
+        self.tree.grid(row=2, column=0, sticky="nsew", padx=18, pady=8)
+        for col, text, width in (("name", "NOMBRE", 260), ("date", "GUARDADA", 190), ("items", "PRODUCTOS", 100), ("total", "TOTAL", 160)):
+            self.tree.heading(col, text=text)
+            self.tree.column(col, width=width, anchor="e" if col in {"items", "total"} else "w")
+        set_tree_theme(self.tree, self.theme_name)
+        self.tree.bind("<Double-1>", lambda _event: self.resume())
+        actions = themed_frame(self, self.theme_name, panel=True)
+        actions.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 18))
+        actions.columnconfigure((0, 1), weight=1)
+        big_button(actions, "RECUPERAR SELECCIONADA", self.resume, self.theme_name, height=1, bg=c["primary"], fg=c["primary_text"]).grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        big_button(actions, "CERRAR", self.destroy, self.theme_name, height=1).grid(row=0, column=1, sticky="ew", padx=(5, 0))
+
+    def refresh(self) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        query = f"%{self.query_var.get().strip()}%"
+        rows = self.conn.execute("SELECT id, name, created_at, payload FROM held_sales WHERE name LIKE ? ORDER BY id DESC", (query,)).fetchall()
+        for index, row in enumerate(rows):
+            try:
+                items = json.loads(row["payload"]).get("items", [])
+                total = sum(float(item.get("line_total", 0)) for item in items)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                items, total = [], 0
+            self.tree.insert("", "end", iid=str(row["id"]), tags=("even" if index % 2 == 0 else "odd",), values=(row["name"], row["created_at"], len(items), money(total)))
+
+    def resume(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Espera", "Seleccione una venta para recuperar.", parent=self)
+            return
+        self.on_resume(int(selected[0]))
+        self.destroy()
+
+
+class QuickShortcutSettingsWindow(tk.Toplevel, ThemeMixin):
+    def __init__(self, master, conn: sqlite3.Connection, theme_name: str) -> None:
+        self.theme_name = theme_name
+        super().__init__(master)
+        self.conn = conn
+        self.sales_frame = master if isinstance(master, SalesFrame) else None
+        self.title("Comandos rápidos")
+        fit_window(self, 760, 610, min_width=640, min_height=520)
+        self.transient(master)
+        self.apply_common_styles()
+        self._build()
+        self.after(80, self.lift)
+
+    def _build(self) -> None:
+        c = self.colors
+        self.configure(bg=c["bg"])
+        self.columnconfigure(0, weight=1)
+
+        tk.Label(self, text="COMANDOS RÁPIDOS", bg=c["bg"], fg=c["text"], font=FONT_TITLE).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 8))
+        tk.Label(self, text="Asigne teclas físicas para pagar, eliminar ítem y guardar en espera.", bg=c["bg"], fg=c["muted"], font=("Segoe UI", 14, "bold")).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 12))
+
+        body = themed_frame(self, self.theme_name, panel=True, border=True)
+        body.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        body.columnconfigure(0, weight=1)
+
+        self.vars: dict[str, tk.StringVar] = {}
+        for idx, action in enumerate(("pay", "remove_item", "hold_sale")):
+            row = themed_frame(body, self.theme_name, panel=True)
+            row.grid(row=idx, column=0, sticky="ew", padx=14, pady=(8, 0))
+            row.columnconfigure(0, weight=1)
+            row.columnconfigure(1, weight=0)
+            tk.Label(row, text=SHORTCUT_LABELS[action], bg=c["panel"], fg=c["text"], font=("Segoe UI", 15, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=10)
+            var = tk.StringVar(value=self._current_value(action))
+            self.vars[action] = var
+            combo = ttk.Combobox(
+                row,
+                textvariable=var,
+                values=["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "Delete", "BackSpace", "Escape", "P", "H", "X", "E", "C", "Q", "Z"],
+                state="normal",
+                width=12,
+                font=("Segoe UI", 13, "bold"),
+            )
+            combo.grid(row=0, column=1, sticky="e", padx=12, pady=10)
+
+        self.voice_enabled = tk.IntVar(value=int(get_setting(self.conn, "voice_commands_enabled", "0") == "1"))
+        self.voice_vars = {
+            "pay": tk.StringVar(value=get_setting(self.conn, "voice_pay_command", "pagar")),
+            "remove_item": tk.StringVar(value=get_setting(self.conn, "voice_remove_command", "eliminar producto")),
+            "hold_sale": tk.StringVar(value=get_setting(self.conn, "voice_hold_command", "poner en espera")),
+        }
+        voice = themed_frame(body, self.theme_name, panel=True)
+        voice.grid(row=3, column=0, sticky="ew", padx=14, pady=(12, 0))
+        voice.columnconfigure(1, weight=1)
+        tk.Checkbutton(voice, text="Activar comandos de voz (opcional)", variable=self.voice_enabled, bg=c["panel"], fg=c["text"], selectcolor=c["panel"], activebackground=c["panel"], activeforeground=c["text"], font=("Segoe UI", 13, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(10, 4))
+        for row, (action, label) in enumerate((("pay", "Pagar"), ("remove_item", "Eliminar ítem"), ("hold_sale", "Poner en espera")), start=1):
+            tk.Label(voice, text=label, bg=c["panel"], fg=c["text"], font=("Segoe UI", 12, "bold")).grid(row=row, column=0, sticky="w", padx=12, pady=4)
+            tk.Entry(voice, textvariable=self.voice_vars[action], font=("Segoe UI", 12)).grid(row=row, column=1, sticky="ew", padx=12, pady=4)
+        tk.Label(voice, text="Requiere micrófono y SpeechRecognition; si no están disponibles, el POS sigue funcionando.", bg=c["panel"], fg=c["muted"], font=("Segoe UI", 10, "bold"), wraplength=620, justify="left").grid(row=4, column=0, columnspan=2, sticky="w", padx=12, pady=(4, 10))
+
+        actions = themed_frame(body, self.theme_name, panel=True)
+        actions.grid(row=4, column=0, sticky="ew", padx=14, pady=(12, 14))
+        actions.columnconfigure((0, 1), weight=1)
+        big_button(actions, "GUARDAR", self.save_shortcuts, self.theme_name, height=1, bg=c["primary"], fg=c["primary_text"]).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        big_button(actions, "CERRAR", self.destroy, self.theme_name, height=1).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+    def _current_value(self, action: str) -> str:
+        if self.sales_frame is not None:
+            return self.sales_frame._shortcut_settings.get(action, DEFAULT_SHORTCUTS[action])
+        return get_setting(self.conn, f"shortcut_{action}", DEFAULT_SHORTCUTS[action]) or DEFAULT_SHORTCUTS[action]
+
+    def save_shortcuts(self) -> None:
+        for action in ("pay", "remove_item", "hold_sale"):
+            value = self.vars[action].get().strip()
+            if not value:
+                value = DEFAULT_SHORTCUTS[action]
+            set_setting(self.conn, f"shortcut_{action}", value)
+            set_setting(self.conn, f"voice_{action}_command", self.voice_vars[action].get().strip().lower() or action)
+        set_setting(self.conn, "voice_commands_enabled", "1" if self.voice_enabled.get() else "0")
+        if self.sales_frame is not None:
+            self.sales_frame.refresh_shortcuts()
+            self.sales_frame._start_voice_commands_if_enabled()
+        messagebox.showinfo("Atajos", "Comandos rápidos guardados.")
+        self.destroy()
+
+
+class VoidReasonDialog(tk.Toplevel, ThemeMixin):
+    def __init__(self, master, theme_name: str, invoice_no: str) -> None:
+        self.theme_name = theme_name
+        super().__init__(master)
+        self.invoice_no = invoice_no
+        self.result: str | None = None
+        self.reason_var = tk.StringVar()
+        self.title("Motivo de anulación")
+        fit_window(self, 760, 360, min_width=640, min_height=320)
+        self.transient(master)
+        self.attributes("-topmost", True)
+        self.apply_common_styles()
+        self._build()
+        self.update_idletasks()
+        self.after(80, self._focus_entry)
+        self.after(220, self._focus_entry)
+        pop_in_window(self)
+
+    def _build(self) -> None:
+        c = self.colors
+        self.configure(bg=c["bg"])
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        tk.Label(self, text="MOTIVO DE ANULACIÓN", bg=c["bg"], fg=c["text"], font=FONT_TITLE).grid(row=0, column=0, sticky="w", padx=18, pady=(18, 10))
+        tk.Label(self, text=f"Factura: {self.invoice_no}", bg=c["bg"], fg=c["muted"], font=("Segoe UI", 14, "bold")).grid(row=1, column=0, sticky="w", padx=18, pady=(0, 8))
+
+        body = themed_frame(self, self.theme_name, panel=True, border=True)
+        body.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 18))
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        tk.Label(body, text="Escriba el motivo para anular esta factura:", bg=c["panel"], fg=c["text"], font=("Segoe UI", 15, "bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(16, 8))
+        self.entry = tk.Text(
+            body,
+            font=("Segoe UI", 15),
+            bg=c["input_bg"],
+            fg=c["input_text"],
+            insertbackground=c["input_text"],
+            relief="solid",
+            padx=8,
+            pady=8,
+            height=6,
+        )
+        self.entry.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 12))
+        self.entry.bind("<Key>", lambda _event: self.reason_var.set(self.entry.get("1.0", "end-1c")))
+
+        actions = themed_frame(body, self.theme_name, panel=True)
+        actions.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
+        actions.columnconfigure((0, 1), weight=1)
+        big_button(actions, "ACEPTAR", self._confirm, self.theme_name, height=1, bg=c["primary"], fg=c["primary_text"]).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        big_button(actions, "CANCELAR", self._cancel, self.theme_name, height=1).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+    def _focus_entry(self) -> None:
+        if not hasattr(self, "entry") or self.entry is None:
+            return
+        try:
+            self.entry.focus_force()
+            self.entry.delete("1.0", "end")
+            self.entry.insert("1.0", self.reason_var.get())
+            self.entry.mark_set("insert", "end")
+            self.entry.see("end")
+            self.focus_force()
+            self.lift()
+            self.grab_set()
+            self.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _confirm(self) -> None:
+        reason = self.entry.get("1.0", "end").strip()
+        if not reason:
+            messagebox.showwarning("Motivo", "Debe escribir un motivo para anular la factura.", parent=self)
+            self.entry.focus_force()
+            return
+        self.result = reason.upper()
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+
 class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
     def __init__(
         self,
@@ -1840,7 +2234,6 @@ class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
         self.title("Anular factura")
         fit_window(self, 1260, 780, min_width=1120, min_height=700)
         self.transient(master)
-        self.grab_set()
         self.apply_common_styles()
         self._build()
         self.refresh()
@@ -1893,16 +2286,18 @@ class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
 
         actions = themed_frame(self, self.theme_name, panel=True)
         actions.grid(row=3, column=0, sticky="ew", padx=18, pady=(8, 18))
-        actions.columnconfigure((0, 1, 2, 3), weight=1)
+        actions.columnconfigure((0, 1, 2, 3, 4, 5), weight=1)
         big_button(actions, "ANULAR FACTURA", self.annul_selected, self.theme_name, height=1, bg=c["danger"], fg="#ffffff").grid(
             row=0,
             column=0,
             sticky="ew",
             padx=5,
         )
-        big_button(actions, "VER DETALLE", self.show_selected_sale_detail, self.theme_name, height=1).grid(row=0, column=1, sticky="ew", padx=5)
-        big_button(actions, "RECARGAR", self.refresh, self.theme_name, height=1).grid(row=0, column=2, sticky="ew", padx=5)
-        big_button(actions, "CERRAR", self.destroy, self.theme_name, height=1).grid(row=0, column=3, sticky="ew", padx=5)
+        big_button(actions, "CORREGIR PAGO A NEQUI", self.change_payment_to_nequi, self.theme_name, height=1).grid(row=0, column=1, sticky="ew", padx=5)
+        big_button(actions, "ANULAR + DEVOLVER NEQUI", lambda: self.annul_selected("NEQUI"), self.theme_name, height=1).grid(row=0, column=2, sticky="ew", padx=5)
+        big_button(actions, "VER DETALLE", self.show_selected_sale_detail, self.theme_name, height=1).grid(row=0, column=3, sticky="ew", padx=5)
+        big_button(actions, "RECARGAR", self.refresh, self.theme_name, height=1).grid(row=0, column=4, sticky="ew", padx=5)
+        big_button(actions, "CERRAR", self.destroy, self.theme_name, height=1).grid(row=0, column=5, sticky="ew", padx=5)
 
     def refresh(self) -> None:
         for item in self.tree.get_children():
@@ -1935,7 +2330,7 @@ class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
                 ),
             )
 
-    def annul_selected(self) -> None:
+    def annul_selected(self, refund_method: str = "") -> None:
         selected = self.tree.selection()
         if not selected:
             play_sound(self.conn, "warn")
@@ -1958,11 +2353,14 @@ class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
             play_sound(self.conn, "error")
             messagebox.showerror("Factura", "Clave maestra incorrecta.")
             return
-        reason = simpledialog.askstring("Motivo", f"Motivo para anular {sale['invoice_no']}:", initialvalue="ERROR DE FACTURACION")
+        dialog = VoidReasonDialog(self, self.theme_name, sale["invoice_no"])
+        self.wait_window(dialog)
+        reason = dialog.result
         if reason is None:
             return
         reason = reason.strip().upper() or "SIN MOTIVO"
-        if not messagebox.askyesno("Anular factura", f"Â¿Anular la factura {sale['invoice_no']}?\n\nSe restaurara el inventario."):
+        refund_note = f"\n\nLa devolución quedará registrada por {refund_method}." if refund_method else ""
+        if not messagebox.askyesno("Anular factura", f"Â¿Anular la factura {sale['invoice_no']}?\n\nSe restaurara el inventario.{refund_note}"):
             return
         voided_at = now_text()
         voided_by = get_setting(self.conn, "store_username", "") or get_setting(self.conn, "store_name", "") or "ADMIN"
@@ -1979,10 +2377,10 @@ class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
             self.conn.execute(
                 """
                 UPDATE sales
-                SET status = 'ANULADA', voided_at = ?, voided_reason = ?, voided_by = ?
+                SET status = 'ANULADA', voided_at = ?, voided_reason = ?, voided_by = ?, refund_method = ?
                 WHERE id = ?
                 """,
-                (voided_at, reason, voided_by, sale_id),
+                (voided_at, reason, voided_by, refund_method or None, sale_id),
             )
             self.conn.commit()
         except Exception as exc:
@@ -1990,7 +2388,30 @@ class InvoiceVoidWindow(tk.Toplevel, ThemeMixin):
             messagebox.showerror("Factura", f"No se pudo anular la factura.\n\n{exc}")
             return
         play_sound(self.conn, "ok")
-        messagebox.showinfo("Factura", f"Factura {sale['invoice_no']} anulada.")
+        messagebox.showinfo("Factura", f"Factura {sale['invoice_no']} anulada." + (f" Devolución: {refund_method}." if refund_method else ""))
+        self.refresh()
+        if self.on_annulled:
+            self.on_annulled()
+
+    def change_payment_to_nequi(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            play_sound(self.conn, "warn")
+            return
+        sale = self.conn.execute("SELECT id, invoice_no, total, status FROM sales WHERE id = ?", (int(selected[0]),)).fetchone()
+        if sale is None or (sale["status"] or "COMPLETED") == "ANULADA":
+            messagebox.showwarning("Pago", "Solo puede corregir una factura activa.")
+            return
+        master = ask_secret(self, "Clave maestra", "Ingrese la clave maestra para corregir el pago:", theme_name=self.theme_name)
+        if master is None or not verify_secret(master, get_setting(self.conn, "master_hash", "")):
+            messagebox.showerror("Pago", "Clave maestra incorrecta.")
+            return
+        if not messagebox.askyesno("Corregir pago", f"¿Cambiar la factura {sale['invoice_no']} de efectivo a Nequi?\n\nLa venta y el inventario no se modificarán; solo cambiará el método en reportes."):
+            return
+        self.conn.execute("UPDATE sales SET cash = 0, nequi = ?, payment_type = 'NEQUI' WHERE id = ?", (float(sale["total"] or 0), sale["id"]))
+        self.conn.commit()
+        play_sound(self.conn, "ok")
+        messagebox.showinfo("Pago", f"Factura {sale['invoice_no']} corregida a Nequi.")
         self.refresh()
         if self.on_annulled:
             self.on_annulled()
@@ -2115,4 +2536,3 @@ def expected_theme_for_time(night_start: str, night_end: str) -> str:
     else:
         is_night = current >= start or current < end
     return "night" if is_night else "day"
-

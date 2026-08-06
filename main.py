@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import shutil
 import sys
 import tkinter as tk
+import random
 from pathlib import Path
 from tkinter import messagebox
 
@@ -22,13 +25,38 @@ from modules.security import get_setting
 from modules.theme import apply_window_icon, fit_window
 
 
+def _run_updater_if_needed() -> None:
+    if not getattr(sys, "frozen", False):
+        return
+    app_dir = Path(sys.executable).resolve().parent
+    update_dir = app_dir / "update"
+    update_exe = update_dir / "AREZONE.exe"
+    if not update_exe.exists():
+        return
+    try:
+        target_exe = app_dir / "AREZONE.exe"
+        if target_exe.exists() and target_exe.resolve() != update_exe.resolve():
+            target_exe.unlink(missing_ok=True)
+        shutil.copy2(update_exe, target_exe)
+        update_exe.unlink(missing_ok=True)
+        if update_dir.exists():
+            try:
+                os.rmdir(update_dir)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 class ArezoneApp(tk.Tk):
     def __init__(self) -> None:
+        _run_updater_if_needed()
         super().__init__()
         self.config_data = load_config()
-        self.title(f"{self.config_data['app_name']} POS")
+        self._welcome_shown = False
+        self.title(f"{self.config_data['app_name']} POS {self.config_data['version']}")
         self._apply_icon()
-        fit_window(self, 1280, 780, min_width=1040, min_height=650)
+        fit_window(self, 1380, 860, min_width=1100, min_height=720)
         self.configure(bg="#dfe5ea")
 
         self.conn = connect()
@@ -39,6 +67,7 @@ class ArezoneApp(tk.Tk):
             self.bind("<Escape>", lambda _event: self.attributes("-fullscreen", False))
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.bind("<Configure>", lambda _event: self.update_idletasks())
         self.start_flow()
 
     def clear(self) -> None:
@@ -68,6 +97,19 @@ class ArezoneApp(tk.Tk):
             fill="both",
             expand=True,
         )
+        if not self._welcome_shown:
+            self._welcome_shown = True
+            self.after(450, self.show_business_welcome)
+
+    def show_business_welcome(self) -> None:
+        phrases = (
+            "Cada venta bien atendida hace crecer la confianza en tu negocio.",
+            "La prosperidad de un negocio nace de cuidar cada cliente y cada detalle.",
+            "Hoy es una nueva oportunidad para convertir buen servicio en crecimiento.",
+            "Un negocio ordenado transforma el esfuerzo diario en prosperidad.",
+            "La constancia en las pequeñas ventas construye grandes resultados.",
+        )
+        messagebox.showinfo("AREZONE", random.choice(phrases))
 
     def on_close(self) -> None:
         if messagebox.askyesno("Salir", "Desea cerrar AREZONE?"):

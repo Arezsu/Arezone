@@ -11,6 +11,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from database.db import now_text
 from modules.formatters import money, number, parse_amount
 from modules.product_codes import split_primary_and_alternates
+from modules.product_search import search_products
 from modules.security import get_setting, verify_secret
 from modules.theme import fit_window
 from modules.ui_fx import ask_secret, pop_in_window
@@ -76,16 +77,7 @@ class InventoryWindow(tk.Toplevel):
     def search(self) -> None:
         for row in self.tree.get_children():
             self.tree.delete(row)
-        query = f"%{self.query_var.get().strip()}%"
-        rows = self.conn.execute(
-            """
-            SELECT * FROM products
-            WHERE code LIKE ? OR name LIKE ? OR brand LIKE ? OR category LIKE ? OR COALESCE(alt_codes, '') LIKE ?
-            ORDER BY name
-            LIMIT 500
-            """,
-            (query, query, query, query, query),
-        ).fetchall()
+        rows = search_products(self.conn, self.query_var.get(), limit=500)
         for row in rows:
             self.tree.insert(
                 "",

@@ -1381,6 +1381,63 @@ THEMES = {
         "tree_fg": "#fce7f3",
         "tree_heading": "#475569",
     },
+    "nintendo": {
+        "name": "NINTENDO",
+        "bg": "#f8f8f8",
+        "panel": "#ffffff",
+        "panel_alt": "#e8f0ff",
+        "text": "#1f2937",
+        "muted": "#4b5563",
+        "primary": "#e60012",
+        "primary_text": "#ffffff",
+        "danger": "#b91c1c",
+        "warning": "#f59e0b",
+        "button": "#c8000f",
+        "button_text": "#ffffff",
+        "input_bg": "#ffffff",
+        "input_text": "#111827",
+        "tree_bg": "#ffffff",
+        "tree_fg": "#111827",
+        "tree_heading": "#fee2e2",
+    },
+    "playstation": {
+        "name": "PLAYSTATION",
+        "bg": "#07111e",
+        "panel": "#0f172a",
+        "panel_alt": "#1e293b",
+        "text": "#f8fafc",
+        "muted": "#93c5fd",
+        "primary": "#0070d1",
+        "primary_text": "#ffffff",
+        "danger": "#ef4444",
+        "warning": "#fbbf24",
+        "button": "#0056a5",
+        "button_text": "#ffffff",
+        "input_bg": "#020617",
+        "input_text": "#f8fafc",
+        "tree_bg": "#0f172a",
+        "tree_fg": "#f8fafc",
+        "tree_heading": "#1d4ed8",
+    },
+    "xbox": {
+        "name": "XBOX",
+        "bg": "#0b0f1a",
+        "panel": "#111827",
+        "panel_alt": "#172033",
+        "text": "#f8fafc",
+        "muted": "#86efac",
+        "primary": "#107c10",
+        "primary_text": "#ffffff",
+        "danger": "#ef4444",
+        "warning": "#fbbf24",
+        "button": "#0f6b0f",
+        "button_text": "#ffffff",
+        "input_bg": "#020617",
+        "input_text": "#f8fafc",
+        "tree_bg": "#111827",
+        "tree_fg": "#f8fafc",
+        "tree_heading": "#14532d",
+    },
 }
 
 
@@ -1718,10 +1775,10 @@ def fit_window(window, width: int, height: int, *, min_width: int | None = None,
     window.update_idletasks()
     screen_width = max(window.winfo_screenwidth(), 1024)
     screen_height = max(window.winfo_screenheight(), 720)
-    target_width = min(width, max(820, int(screen_width * 0.94)))
-    target_height = min(height, max(580, int(screen_height * 0.92)))
-    min_w = min_width or min(target_width, 820)
-    min_h = min_height or min(target_height, 580)
+    min_w = min_width or min(width, 820)
+    min_h = min_height or min(height, 580)
+    target_width = max(min_w, min(width, max(820, int(screen_width * 0.94))))
+    target_height = max(min_h, min(height, max(580, int(screen_height * 0.92))))
     window.minsize(min_w, min_h)
     x = max(0, (screen_width - target_width) // 2)
     y = max(0, (screen_height - target_height) // 2)

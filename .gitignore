@@ -10,3 +10,11 @@ dist/
 installer/output/
 .venv/
 venv/
+
+# Generated release artifacts
+release/app/
+release/instalador/
+release/*.zip
+release/*.rar
+tmp_test_paths/
+

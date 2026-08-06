@@ -39,6 +39,7 @@ class PaymentWindow(tk.Toplevel):
         customer: str,
         theme_name: str,
         on_complete: Callable[[str], None],
+        confirm_shortcut: str = "F1",
     ) -> None:
         self.theme_name = theme_name
         super().__init__(master)
@@ -47,6 +48,7 @@ class PaymentWindow(tk.Toplevel):
         self.seller = seller
         self.customer = customer
         self.on_complete = on_complete
+        self.confirm_shortcut = confirm_shortcut
         self.total = sum(float(item["line_total"]) for item in items)
         self.tax_summary = calculate_tax_summary(items)
 
@@ -56,6 +58,9 @@ class PaymentWindow(tk.Toplevel):
         self.difference_var = tk.StringVar(value="CERO")
         self.change_var = tk.StringVar(value=money(0))
         self._replace_next = {"cash": True, "nequi": True}
+        self._closing = False
+        self._finishing = False
+        self._confirming = False
         self.title("Pago de venta")
         fit_window(self, PAY_WIN_W, PAY_WIN_H, min_width=960, min_height=680)
         self.resizable(True, True)
@@ -64,6 +69,7 @@ class PaymentWindow(tk.Toplevel):
         apply_window_icon(self)
         self.transient(master)
         self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._safe_close)
         self._build()
         self._bind_keys()
         self.update_difference()
@@ -118,7 +124,7 @@ class PaymentWindow(tk.Toplevel):
         )
         self.btn_pagar.grid(row=0, column=0, sticky="ew", padx=(0, 6), ipady=6)
         self.btn_volver = ps5_glow_button(
-            actions, "VOLVER", self.destroy, tn,
+            actions, "VOLVER", self._safe_close, tn,
             bg=PS5_DANGER, fg="#ffffff", large=True, glow_color="#ff4d6d", glow_fg="#ffffff",
         )
         self.btn_volver.grid(row=0, column=1, sticky="ew", padx=(6, 0), ipady=6)
@@ -182,7 +188,9 @@ class PaymentWindow(tk.Toplevel):
         return self.cash_var if key == "cash" else self.nequi_var
 
     def _bind_keys(self) -> None:
-        self._global_keys = ("<F1>", "<F2>")
+        shortcut = self.confirm_shortcut.strip().strip("<>") or "F1"
+        self._confirm_sequence = f"<KeyPress-{shortcut}>"
+        self._global_keys = tuple(dict.fromkeys(("<F1>", "<F2>", self._confirm_sequence)))
         for seq in self._global_keys:
             self.bind_all(seq, self._on_global_key, add="+")
             self.bind_class("Entry", seq, self._on_global_key, add="+")
@@ -191,11 +199,11 @@ class PaymentWindow(tk.Toplevel):
         self.bind("<Destroy>", self._release_global_keys, add="+")
 
     def _on_global_key(self, event: tk.Event):
-        if event.keysym == "F1":
+        if event.keysym == "F1" or event.keysym.lower() == self.confirm_shortcut.strip().strip("<>").lower():
             self.finish()
             return "break"
         if event.keysym == "F2":
-            self.destroy()
+            self._safe_close()
             return "break"
         return None
 
@@ -211,7 +219,7 @@ class PaymentWindow(tk.Toplevel):
         if keysym in ("F1", "F2"):
             return "break"
         if keysym == "Escape":
-            self.destroy()
+            self._safe_close()
             return "break"
         if keysym in ("Left", "Up"):
             self._focus_group.move(-1)
@@ -289,14 +297,40 @@ class PaymentWindow(tk.Toplevel):
         self.difference_var.set("CERO" if difference <= 0 else money(difference))
         self.change_var.set(money(change if change > 0 else 0))
 
+    def _safe_close(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        self._release_global_keys()
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except tk.TclError:
+            pass
+
     def finish(self) -> None:
+        if getattr(self, "_closing", False) or getattr(self, "_finishing", False) or getattr(self, "_confirming", False):
+            return
         if self.paid_amount() + 0.01 < self.total:
             play_sound(self.conn, "warn")
             messagebox.showwarning("Pago", "Falta dinero para terminar la venta.")
             return
-        if not messagebox.askyesno("Terminar venta", "Esta seguro de terminar esta venta?"):
+        self._confirming = True
+        try:
+            confirmed = messagebox.askyesno("Terminar venta", "Esta seguro de terminar esta venta?")
+        except Exception:
+            confirmed = False
+        self._confirming = False
+        if not confirmed:
             play_sound(self.conn, "tap")
+            self._closing = False
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+            self.after(50, self.focus_force)
             return
+
+        self._finishing = True
 
         invoice_no = get_next_invoice_no(self.conn)
         created_at = now_text()
@@ -375,9 +409,27 @@ class PaymentWindow(tk.Toplevel):
                 save_drawer_signal(invoice_no)
 
         play_sound(self.conn, "ok")
-        messagebox.showinfo("Venta", f"Venta {invoice_no} terminada.\n\nCambio: {self.change_var.get()}")
-        self.on_complete(ticket)
-        self.destroy()
+        try:
+            messagebox.showinfo("Venta", f"Venta {invoice_no} terminada.\n\nCambio: {self.change_var.get()}")
+        except Exception:
+            pass
+
+        try:
+            if self.winfo_exists():
+                self.destroy()
+        except tk.TclError:
+            pass
+
+        try:
+            if self.master and getattr(self.master, "winfo_exists", lambda: False)():
+                self.master.after(500, lambda: self.on_complete(ticket))
+            else:
+                self.on_complete(ticket)
+        except Exception:
+            try:
+                self.on_complete(ticket)
+            except Exception:
+                pass
 
 
 def save_drawer_signal(invoice_no: str) -> Path:

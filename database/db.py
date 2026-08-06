@@ -10,7 +10,18 @@ from modules.app_config import DATA_DIR
 DB_PATH = DATA_DIR / "arezone.db"
 
 
+def _migrate_legacy_paths() -> None:
+    try:
+        legacy_db = Path(__file__).resolve().parents[1] / "data" / "arezone.db"
+        if legacy_db.exists() and not DB_PATH.exists():
+            DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+            DB_PATH.write_bytes(legacy_db.read_bytes())
+    except Exception:
+        pass
+
+
 def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
+    _migrate_legacy_paths()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -71,7 +82,8 @@ def initialize_database(conn: sqlite3.Connection) -> None:
             status TEXT DEFAULT 'COMPLETED',
             voided_at TEXT,
             voided_reason TEXT,
-            voided_by TEXT
+            voided_by TEXT,
+            refund_method TEXT
         );
 
         CREATE TABLE IF NOT EXISTS sale_items (
@@ -117,6 +129,7 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS held_sales (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT 'VENTA EN ESPERA',
             payload TEXT NOT NULL
         );
         """
@@ -130,8 +143,10 @@ def initialize_database(conn: sqlite3.Connection) -> None:
             "voided_at": "TEXT",
             "voided_reason": "TEXT",
             "voided_by": "TEXT",
+            "refund_method": "TEXT",
         },
     )
+    _add_missing_columns(conn, "held_sales", {"name": "TEXT NOT NULL DEFAULT 'VENTA EN ESPERA'"})
     conn.commit()
 
 

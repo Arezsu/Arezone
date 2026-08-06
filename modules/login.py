@@ -28,11 +28,14 @@ class LoginFrame(ttk.Frame, ThemeMixin):
         card = themed_frame(self, self.theme_name, panel=True, border=True)
         card.grid(row=0, column=0, sticky="nsew", padx=48, pady=32)
         card.columnconfigure((0, 1, 2), weight=1)
+        card.rowconfigure(7, weight=1)
 
         branding = tk.Frame(card, bg=c["panel"])
-        branding.grid(row=0, column=0, columnspan=3, sticky="w", padx=42, pady=(28, 8))
+        branding.grid(row=0, column=0, columnspan=3, sticky="ew", padx=42, pady=(28, 8))
+        branding.columnconfigure(1, weight=1)
         app_logo_label(branding, self.theme_name, size=46, panel=True).grid(row=0, column=0, sticky="w")
         tk.Label(branding, text="AREZONE", bg=c["panel"], fg=c["text"], font=FONT_TITLE).grid(row=0, column=1, sticky="w", padx=(12, 0))
+        tk.Label(branding, text=self._version_label(), bg=c["panel"], fg=c["muted"], font=("Segoe UI", 12)).grid(row=1, column=1, sticky="w", padx=(12, 0), pady=(2, 0))
         tk.Label(card, text="Ingrese su clave", bg=c["panel"], fg=c["muted"], font=FONT_BIG).grid(row=1, column=0, columnspan=3, pady=(0, 18))
 
         entry = tk.Entry(
@@ -46,6 +49,7 @@ class LoginFrame(ttk.Frame, ThemeMixin):
             insertbackground=c["input_text"],
         )
         entry.grid(row=2, column=0, columnspan=3, sticky="ew", padx=72, pady=(0, 22), ipady=16)
+        entry.configure(width=18)
         entry.focus_set()
         entry.bind("<Return>", lambda _event: self.try_login())
 
@@ -62,8 +66,16 @@ class LoginFrame(ttk.Frame, ThemeMixin):
         footer = themed_frame(card, self.theme_name, panel=True)
         footer.grid(row=7, column=0, columnspan=3, sticky="ew", padx=72, pady=(20, 32))
         footer.columnconfigure((0, 1), weight=1)
+        footer.columnconfigure((0, 1), weight=1)
         big_button(footer, "CAMBIAR CLAVE", self.change_password, self.theme_name, height=1).grid(row=0, column=0, sticky="ew", padx=8)
         big_button(footer, "SALIR", self.winfo_toplevel().destroy, self.theme_name, bg=c["danger"], fg="#ffffff", height=1).grid(row=0, column=1, sticky="ew", padx=8)
+
+    def _version_label(self) -> str:
+        from modules.app_config import load_config
+        try:
+            return f"Versión {load_config().get('version', 'v2.0 Voicetest')}"
+        except Exception:
+            return "Versión v2.0 Voicetest"
 
     def add_digit(self, digit: str) -> None:
         current = self.pin_var.get()

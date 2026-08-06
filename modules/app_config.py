@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any
 
 
-def _resolve_user_dir(base_dir: Path) -> Path:
+def resolve_runtime_root(base_dir: Path, env: dict[str, str] | None = None) -> Path:
+    env = env or os.environ
     candidates = []
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    local_app_data = env.get("LOCALAPPDATA", "")
     if local_app_data:
         candidates.append(Path(local_app_data) / "ArezOne")
     candidates.append(base_dir / "runtime")
@@ -24,6 +25,10 @@ def _resolve_user_dir(base_dir: Path) -> Path:
         except Exception:
             continue
     return base_dir / "runtime"
+
+
+def _resolve_user_dir(base_dir: Path) -> Path:
+    return resolve_runtime_root(base_dir)
 
 
 if getattr(sys, "frozen", False):
@@ -42,7 +47,7 @@ CONFIG_PATH = CONFIG_DIR / "settings.json"
 DEFAULT_CONFIG: dict[str, Any] = {
     "app_name": "AREZONE",
     "business_name": "AREZONE",
-    "version": "2.1 - Profesional",
+    "version": "v2.0 Voicetest",
     "slogan": "POS rapido, claro y profesional",
     "authors": "Alejandro Sanchez Quimbayo",
     "support_email": "AREZSUPRIV@GMAIL.COM",
@@ -53,10 +58,21 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 
 
+def _migrate_legacy_config() -> None:
+    try:
+        legacy_config = Path(__file__).resolve().parents[1] / "config" / "settings.json"
+        if legacy_config.exists() and not CONFIG_PATH.exists():
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_PATH.write_text(legacy_config.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def ensure_app_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_config()
 
 
 def load_config() -> dict[str, Any]:

@@ -4,8 +4,8 @@ AREZONE es un POS local para Windows, con SQLite, temas grandes, ventas, inventa
 
 ## Arranque
 
-- `2_ABRIR_AREZONE.bat` abre la app en desarrollo.
-- `3_COMPILAR_INSTALADOR.bat` genera el ejecutable y el instalador.
+- `2_ABRIR_AREZONE.bat` abre la app compilada (`release\app`) o en desarrollo con Python.
+- `3_COMPILAR_INSTALADOR.bat` genera el ejecutable y el instalador en `release\`.
 
 ## Flujo inicial
 

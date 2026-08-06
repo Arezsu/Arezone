@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path $PSScriptRoot -Parent
 Set-Location $Root
 
-$DistExe = Join-Path $Root "build_output\staging\app\AREZONE.exe"
+$DistExe = Join-Path $Root "release\app\AREZONE.exe"
 $OutputDir = Join-Path $Root "installer\output"
 $OutputExe = Join-Path $OutputDir "Instalador_AREZONE.exe"
 $Source = Join-Path $Root "installer\InstallerStub.cs"

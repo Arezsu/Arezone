@@ -252,7 +252,8 @@ class ReportsWindow(tk.Toplevel):
         self._clear(self.payment_tree)
         row = self.conn.execute(
             """
-            SELECT COALESCE(SUM(cash), 0) AS cash,
+            SELECT COALESCE(SUM(MAX(MIN(COALESCE(cash, 0), total), 0)), 0) AS cash,
+                   COALESCE(SUM(MAX(MIN(COALESCE(nequi, 0), MAX(total - MAX(COALESCE(cash, 0), 0), 0)), 0)), 0) AS nequi,
                    COALESCE(SUM(card), 0) AS card,
                    COALESCE(SUM(credit), 0) AS credit,
                    COALESCE(SUM(cheque), 0) AS cheque,
@@ -264,6 +265,7 @@ class ReportsWindow(tk.Toplevel):
         ).fetchone()
         labels = [
             ("Efectivo", row["cash"]),
+            ("Nequi", row["nequi"]),
             ("Tarjetas", row["card"]),
             ("Credito", row["credit"]),
             ("Cheque", row["cheque"]),
@@ -298,7 +300,8 @@ class ReportsWindow(tk.Toplevel):
         start, end = values
         row = self.conn.execute(
             """
-            SELECT COALESCE(SUM(cash), 0) AS cash,
+            SELECT COALESCE(SUM(MAX(MIN(COALESCE(cash, 0), total), 0)), 0) AS cash,
+                   COALESCE(SUM(MAX(MIN(COALESCE(nequi, 0), MAX(total - MAX(COALESCE(cash, 0), 0), 0)), 0)), 0) AS nequi,
                    COALESCE(SUM(card), 0) AS card,
                    COALESCE(SUM(credit), 0) AS credit,
                    COALESCE(SUM(cheque), 0) AS cheque,
@@ -308,8 +311,8 @@ class ReportsWindow(tk.Toplevel):
             """,
             (start, end),
         ).fetchone()
-        labels = ["Efectivo", "Tarjetas", "Credito", "Cheque", "Otros"]
-        amounts = [float(row[key] or 0) for key in ("cash", "card", "credit", "cheque", "other")]
+        labels = ["Efectivo", "Nequi", "Tarjetas", "Credito", "Cheque", "Otros"]
+        amounts = [float(row[key] or 0) for key in ("cash", "nequi", "card", "credit", "cheque", "other")]
         self._show_pie_chart("Distribucion de pagos", labels, amounts)
 
     def _show_bar_chart(self, title: str, labels: list[str], values: list[float]) -> None:
